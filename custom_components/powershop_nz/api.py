@@ -614,65 +614,20 @@ class PowershopAPIClient:
         period_start = billing_options.get("currentBillingPeriodStartDate")
         period_end = billing_options.get("currentBillingPeriodEndDate")
 
-        # Extract rates from the first meter point's active agreement.
-        # Normalise tariff labels so sensor.py can use stable keys.
+        # Extract rates from the first meter point's active agreement
         rate_periods: Dict[str, Any] = {}
-
-        rate_label_map = {
-            "peak": "peak",
-            "shoulder": "shoulder",
-            "off peak": "off_peak",
-            "super off peak": "super_off_peak",
-            "weekend": "weekend",
-        }
-
         property_node = agreement_data.get("property", {})
-
         for mp in property_node.get("meterPoints", []):
             agreement = mp.get("activeAgreement") or {}
-
             for rate in agreement.get("rates", []):
-                displayed_label = (
-                    rate.get("displayLabel")
-                    or rate.get("label")
-                    or "Unknown"
-                )
-
-                normalised_label = displayed_label.strip().casefold()
-                rate_key = rate_label_map.get(normalised_label)
-
-                # Retain unknown tariff types using a safe generated key.
-                if rate_key is None:
-                    rate_key = re.sub(
-                        r"[^a-z0-9]+",
-                        "_",
-                        normalised_label,
-                    ).strip("_")
-
-                raw_rate = _parse_rate(
-                    rate.get("formattedRateIncludingTax")
-                )
-
-                rate_periods[rate_key] = {
-                    "label": displayed_label,
-                    "rate": (
-                        round(raw_rate * 100, 4)
-                        if raw_rate is not None
-                        else None
-                    ),
-                    "rate_formatted": rate.get(
-                        "formattedRateIncludingTax"
-                    ),
-                    "rate_excl_tax": rate.get(
-                        "formattedRateExcludingTax"
-                    ),
-                    "has_discount": rate.get(
-                        "hasDiscount",
-                        False,
-                    ),
+                label = rate.get("displayLabel") or rate.get("label") or "Unknown"
+                raw_rate = _parse_rate(rate.get("formattedRateIncludingTax"))
+                rate_periods[label] = {
+                    "rate": round(raw_rate * 100, 4) if raw_rate is not None else None,
+                    "rate_formatted": rate.get("formattedRateIncludingTax"),
+                    "rate_excl_tax": rate.get("formattedRateExcludingTax"),
+                    "has_discount": rate.get("hasDiscount", False),
                 }
-
-            
             break  # Only process first meter point
 
         # Compute upcoming billing period date ranges (next 5 months)
