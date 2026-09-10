@@ -32,11 +32,38 @@ _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(minutes=15)
 
-# Keyword sets used for matching rate labels from the API
+# Exact API tariff labels for each Home Assistant rate sensor.
+# Exact matching prevents "Peak" matching "Off Peak" or "Super Off Peak".
+_RATE_LABELS = {
+    "peak_rate": {
+        "weekday peak",
+        "peak",
+    },
+    "shoulder_rate": {
+        "weekday shoulder",
+        "shoulder",
+    },
+    "off_peak_rate": {
+        "weekday off peak",
+        "off peak",
+        "offpeak",
+    },
+    "super_off_peak_rate": {
+        "super off peak",
+        "super offpeak",
+        "superoffpeak",
+    },
+    "weekend_rate": {
+        "weekend day",
+        "weekend night",
+        "weekend",
+    },
+}
+
+# Fallback keywords retained for less common API labels.
 _OFF_PEAK_KEYWORDS = {"off peak", "offpeak", "night", "low", "uncontrolled"}
 _PEAK_KEYWORDS = {"peak", "day", "weekday peak", "high"}
-_SHOULDER_KEYWORDS = {"shoulder", "weekend", "controlled"}
-_STANDING_KEYWORDS = {"daily", "standing", "fixed", "supply"}
+_SHOULDER_KEYWORDS = {"shoulder", "controlled"}
 
 SENSORS = [
     SensorEntityDescription(
@@ -67,6 +94,20 @@ SENSORS = [
         native_unit_of_measurement="c/kWh",
         state_class=None,
         icon="mdi:clock",
+    ),
+    SensorEntityDescription(
+        key="super_off_peak_rate",
+        name="Super Off Peak Rate",
+        native_unit_of_measurement="c/kWh",
+        state_class=None,
+        icon="mdi:weather-night",
+    ),
+    SensorEntityDescription(
+        key="weekend_rate",
+        name="Weekend Rate",
+        native_unit_of_measurement="c/kWh",
+        state_class=None,
+        icon="mdi:calendar-weekend",
     ),
     SensorEntityDescription(
         key="usage_today",
@@ -141,14 +182,35 @@ SENSORS = [
 ]
 
 
+def _normalise_label(label: str) -> str:
+    """Normalise API tariff labels for reliable matching."""
+    return " ".join(
+        label.casefold()
+        .replace("_", " ")
+        .replace("-", " ")
+        .split()
+    )
+
+
+def _match_exact_rate(
+    rate_periods: Dict[str, Any], accepted_labels: set[str]
+) -> Optional[float]:
+    """Return a rate whose API label exactly matches an accepted label."""
+    normalised_labels = {_normalise_label(label) for label in accepted_labels}
+    for label, data in rate_periods.items():
+        if _normalise_label(label) in normalised_labels:
+            return data.get("rate")
+    return None
+
+
 def _match_rate(
     rate_periods: Dict[str, Any],
     keywords: set,
     exclude_keywords: Optional[set] = None,
 ) -> Optional[float]:
-    """Return the first rate whose label contains any of *keywords*."""
+    """Return the first rate whose label contains any keyword."""
     for label, data in rate_periods.items():
-        label_lower = label.lower()
+        label_lower = _normalise_label(label)
         if exclude_keywords and any(kw in label_lower for kw in exclude_keywords):
             continue
         if any(kw in label_lower for kw in keywords):
@@ -181,16 +243,22 @@ class PowershopDataUpdateCoordinator(DataUpdateCoordinator):
         try:
             data = await self.client.get_rate_data(account_number, property_id)
         except AuthError as err:
-            # Refresh token expired/revoked – trigger HA re-auth flow
             raise ConfigEntryAuthFailed(str(err)) from err
         except Exception as err:
             raise UpdateFailed(f"Error communicating with Powershop API: {err}") from err
 
-        _MEASUREMENT_KEYS = (
-            "usage_today_kwh", "usage_period_kwh", "cost_period_nzd",
-            "cost_used_nzd", "cost_estimated_nzd", "cost_still_to_buy_nzd",
-            "period_coverage_pct", "upcoming_periods", "daily_charge_nzd",
-            "hourly_usage", "daily_usage",
+        measurement_keys = (
+            "usage_today_kwh",
+            "usage_period_kwh",
+            "cost_period_nzd",
+            "cost_used_nzd",
+            "cost_estimated_nzd",
+            "cost_still_to_buy_nzd",
+            "period_coverage_pct",
+            "upcoming_periods",
+            "daily_charge_nzd",
+            "hourly_usage",
+            "daily_usage",
         )
         if not data.get("measurement_ok", True):
             self._measurement_fail_count += 1
@@ -200,17 +268,16 @@ class PowershopDataUpdateCoordinator(DataUpdateCoordinator):
             )
             if self._measurement_fail_count >= 12:
                 raise UpdateFailed(
-                    f"Powershop measurement data has been unavailable for "
+                    "Powershop measurement data has been unavailable for "
                     f"{self._measurement_fail_count} consecutive polls (~3 hours)"
                 )
             data.update(self._cached_measurement_data)
         else:
             self._measurement_fail_count = 0
             self._cached_measurement_data = {
-                k: data[k] for k in _MEASUREMENT_KEYS if k in data
+                key: data[key] for key in measurement_keys if key in data
             }
 
-        # If the refresh token was rotated, persist the new one
         if self.client.refresh_token != self._config_entry.data.get(CONF_REFRESH_TOKEN):
             self.hass.config_entries.async_update_entry(
                 self._config_entry,
@@ -273,10 +340,25 @@ class PowershopSensor(CoordinatorEntity, SensorEntity):
 
         rate_periods = data.get("rate_periods", {})
 
+        if key in _RATE_LABELS:
+            exact_rate = _match_exact_rate(rate_periods, _RATE_LABELS[key])
+            if exact_rate is not None:
+                return exact_rate
+
+        # Fallbacks for legacy or alternative labels.
         if key == "off_peak_rate":
-            return _match_rate(rate_periods, _OFF_PEAK_KEYWORDS)
+            return _match_rate(
+                rate_periods,
+                _OFF_PEAK_KEYWORDS,
+                exclude_keywords={"super off peak", "super offpeak", "superoffpeak"},
+            )
         if key == "peak_rate":
-            return _match_rate(rate_periods, _PEAK_KEYWORDS, exclude_keywords=_OFF_PEAK_KEYWORDS)
+            return _match_rate(
+                rate_periods,
+                _PEAK_KEYWORDS,
+                exclude_keywords=_OFF_PEAK_KEYWORDS
+                | {"super off peak", "super offpeak", "superoffpeak"},
+            )
         if key == "shoulder_rate":
             return _match_rate(rate_periods, _SHOULDER_KEYWORDS)
         if key == "usage_today":
@@ -337,9 +419,10 @@ class PowershopSensor(CoordinatorEntity, SensorEntity):
             attrs["daily_usage"] = data.get("daily_usage", [])
 
         rate_periods = data.get("rate_periods", {})
-        if self.entity_description.key in ("off_peak_rate", "peak_rate", "shoulder_rate"):
+        if self.entity_description.key in _RATE_LABELS:
             attrs["all_rates"] = {
-                label: d.get("rate_formatted") for label, d in rate_periods.items()
+                label: rate_data.get("rate_formatted")
+                for label, rate_data in rate_periods.items()
             }
 
         return attrs
